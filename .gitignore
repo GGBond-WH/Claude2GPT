@@ -1,0 +1,8 @@
+# 本地配置备份 —— 含 Claude 账号 UUID、设备名、ChatGPT App 的 Chromium profile
+backups/
+
+# 固定解释器，按 README 重建即可
+.venv/
+
+__pycache__/
+*.pyc
