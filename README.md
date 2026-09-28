@@ -1,17 +1,33 @@
-# gpt-bridge
+# Claude2GPT
 
-给 Claude 装一个 `ask_gpt(prompt)` 工具，驱动 Chrome 里的 chatgpt.com，不用 OpenAI API。
+一个 MCP server（server 名 `gpt-bridge`），让 Claude 通过你已登录的
+chatgpt.com 标签页和 GPT 讨论问题，不用 OpenAI API。仅限 macOS + Chrome。
+
+四个工具：
 
 ```
-Claude Code
+ask_gpt(prompt)          开新会话提问，确认送达后返回 job_id（不阻塞）
+continue_gpt(prompt)     在当前会话追问，确认送达后返回 job_id
+get_gpt_answer(job_id)   取回答，最多等 45s，没答完就返回当前状态
+read_last_gpt_answer()   重读当前会话最后一轮，不需要 job_id、不发消息
+```
+
+外加一套多轮讨论协议，通过 MCP server instructions 自动注入，
+也可以用 `discuss` prompt 单次调用（见「讨论协议怎么装」）。
+
+```
+Claude Desktop
   └─ MCP (stdio)
-       └─ server.py
-            └─ bridge.py
-                 └─ osascript / Apple Events
-                      └─ Google Chrome  ← execute javascript
-                           └─ chatgpt.com 标签页（按 URL 锁定）
-                                └─ DOM
+       └─ server.py → jobs.py → bridge.py
+                                 └─ osascript / Apple Events
+                                      └─ Google Chrome  ← execute javascript
+                                           └─ chatgpt.com 标签页（按 tab id 锁定）
+                                                ├─ 发送：填输入框、点发送键（DOM）
+                                                └─ 读取：/backend-api/conversation（后端）
 ```
+
+发送走页面 DOM，读取走后端接口 —— 后台标签页里 ChatGPT 会停止渲染对话，
+读 DOM 会拿到半截回答（见「回答怎么读取」）。
 
 ## 为什么是这条路
 
@@ -225,7 +241,7 @@ MCP 的 **tool 自动可用，prompt 必须主动选**。早期版本把协议�
 
 所以要真正独立的第二意见，需要在 ChatGPT 的
 设置 → 个性化 → 记忆 里关掉引用记忆/聊天记录。这是你的账号设置，
-桥接不碰它。开着也能用，只是"独立"要打折扣 —— debate 流程里已经
+桥接不碰它。开着也能用，只是"独立"要打折扣 —— 讨论协议里已经
 提示 Claude 留意 GPT 引用未提及的信息。
 
 ## 边界与注意
