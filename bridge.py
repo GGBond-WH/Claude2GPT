@@ -67,13 +67,14 @@ SELECTORS = {
     ],
 }
 
-POLL_INTERVAL = 0.6      # 秒
+POLL_INTERVAL = 0.6      # 秒，DOM 轮询（发送、新建会话）
+API_POLL = 1.5           # 秒，后端轮询（取回答）
 START_TIMEOUT = 20.0     # 从发送到"看见生成开始"的上限
-GEN_TIMEOUT = 900.0      # 单轮生成的上限（异步模式下不阻塞客户端，可以放宽）
+GEN_TIMEOUT = 900.0      # 一轮里超过这么久没有新消息，视为中断
+BUSY_WINDOW = 900.0      # 后端显示"这一轮没结束"时，最近多久内有动静才算真在进行
 SEND_BTN_TIMEOUT = 6.0   # 等发送键出现的上限
 NEW_CHAT_TIMEOUT = 15.0  # 点新建会话后等页面变空的上限
 LOCK_TIMEOUT = 900.0     # 等其他调用释放锁的上限（任务会排队，等待是正常的）
-STABLE_ROUNDS = 2        # 停止信号消失后，还要连续几轮文本不变才算真的完事
 
 _LOCK = Path.home() / ".gpt_bridge.lock"
 
@@ -109,6 +110,103 @@ function B64(s){
   return btoa(r);
 }
 function generating(){ return !!q("stop"); }
+
+// ---- 后端读取 ----
+// 不读 DOM 的原因：后台标签页里 ChatGPT 会停止渲染对话（实测一个从未显示过的
+// 标签页，生成完毕 5 分钟后 DOM 里仍然一个轮次都没有），而停止按钮的状态照常
+// 更新 —— 于是"停止按钮消失 + 文本不再变化"会把渲染到一半的文本当成完整回答。
+// 这里改走页面自己加载对话时用的同一个接口，拿到的是权威的原始数据。
+function api(path){
+  // 登录态令牌只在这个函数里用，绝不返回，所以不会离开浏览器
+  var s = new XMLHttpRequest(); s.open("GET", "/api/auth/session", false); s.send();
+  var tok = null; try { tok = JSON.parse(s.responseText).accessToken; } catch (e) {}
+  if (!tok) throw new Error("拿不到 ChatGPT 登录态（可能已退出登录）");
+  var x = new XMLHttpRequest(); x.open("GET", path, false);
+  x.setRequestHeader("Authorization", "Bearer " + tok); x.send();
+  if (x.status !== 200) throw new Error("ChatGPT 后端返回 HTTP " + x.status);
+  return JSON.parse(x.responseText);
+}
+function convId(){ var m = location.pathname.match(/\/c\/([0-9a-f-]+)/); return m ? m[1] : null; }
+function branch(d){
+  // 从 current_node 沿 parent 回溯，得到当前显示的这条分支
+  var chain = [], id = d.current_node;
+  while (id && d.mapping[id]) { var n = d.mapping[id]; if (n.message) chain.push(n.message); id = n.parent; }
+  return chain.reverse();
+}
+function role(m){ return (m.author && m.author.role) || ""; }
+function msgText(m){
+  var p = (m.content && m.content.parts) || [];
+  return p.filter(function(x){ return typeof x === "string"; }).join("");
+}
+function isProse(m){
+  // 一轮回答由很多条消息组成：开场白、搜索调用、工具结果、推理、正文……
+  // 只有发给用户看的 assistant 文本才算回答
+  var ct = m.content && m.content.content_type;
+  return role(m) === "assistant" && (ct === "text" || ct === "multimodal_text")
+      && (!m.recipient || m.recipient === "all") && msgText(m).trim().length > 0;
+}
+function cleanUrl(u){
+  return (u || "").replace(/([?&])utm_source=chatgpt\.com(&?)/, function(_, a, b){ return b ? a : ""; });
+}
+function prose(m, refs){
+  // 引用在正文里是私有区字符包起来的标记（U+E200 … U+E201），
+  // content_references 给出每个标记对应的来源。换成 [n]，来源统一列在末尾。
+  var t = msgText(m);
+  ((m.metadata && m.metadata.content_references) || []).forEach(function(r){
+    if (!r.matched_text) return;
+    var rep = "", items = (r.items || []).filter(function(it){ return it && it.url; });
+    if (items.length) {
+      rep = items.map(function(it){
+        var u = cleanUrl(it.url);
+        if (!(u in refs.n)) { refs.list.push({title: it.title || "", url: u}); refs.n[u] = refs.list.length; }
+        return "[" + refs.n[u] + "]";
+      }).join("");
+    } else if (r.alt && !/\]\(https?:/.test(r.alt)) {
+      rep = r.alt;                       // 实体一类的标记，alt 就是显示文字
+    }
+    t = t.split(r.matched_text).join(rep);
+  });
+  return t.replace(/[^]*/g, "");   // 兜底：残留标记一律去掉
+}
+function norm60(s){ return (s || "").replace(/\s+/g, "").slice(0, 60); }
+function idxOf(chain, id){ for (var i = chain.length - 1; i >= 0; i--) if (chain[i].id === id) return i; return -1; }
+function anchorIn(chain, id, prefix, afterId){
+  // 找到这个 job 对应的那条提问。优先按消息 id，找不到再按提问文本。
+  // afterId：只接受出现在它之后的提问 —— 防止连发两条相同的话时认到旧的那条
+  var i, floor = afterId ? idxOf(chain, afterId) : -1;
+  if (id) { i = idxOf(chain, id); if (i > floor) return {idx: i, by: "id"}; }
+  var want = norm60(prefix);
+  if (want) for (i = chain.length - 1; i > floor; i--)
+    if (role(chain[i]) === "user" && norm60(msgText(chain[i])) === want) return {idx: i, by: "text"};
+  return null;
+}
+function lastUserIdx(chain){ for (var i = chain.length - 1; i >= 0; i--) if (role(chain[i]) === "user") return i; return -1; }
+function describeTurn(chain, idx){
+  var turn = [];
+  for (var i = idx + 1; i < chain.length && role(chain[i]) !== "user"; i++) turn.push(chain[i]);
+  var last = turn.length ? turn[turn.length - 1] : null, ask = chain[idx];
+  var refs = {n: {}, list: []};
+  var text = turn.filter(isProse).map(function(m){ return prose(m, refs); }).join("\n\n").trim();
+  if (refs.list.length) text += "\n\n来源：\n" + refs.list.map(function(r, k){
+    return "[" + (k + 1) + "] " + (r.title ? r.title + " — " : "") + r.url; }).join("\n");
+  var now = Date.now() / 1000, ct = last && last.content && last.content.content_type;
+  var fin = last && last.metadata && last.metadata.finish_details;
+  return {
+    anchorId: ask.id, anchorText: msgText(ask).replace(/\s+/g, " ").slice(0, 40),
+    // 权威的完成信号：这一轮最后一条是 end_turn=true 的 assistant 消息
+    complete: !!(last && role(last) === "assistant" && last.end_turn === true),
+    interrupted: !!(fin && fin.type === "interrupted"),
+    lastRole: last ? role(last) : null, lastStatus: last ? last.status : null,
+    phase: !last ? "等待回应"
+         : (role(last) === "tool" || (last.recipient && last.recipient !== "all")) ? "正在调用工具（多半是联网搜索）"
+         : (ct === "thoughts" || ct === "reasoning_recap") ? "正在推理" : "正在输出",
+    nMsgs: turn.length,
+    sinceAsk: ask.create_time ? now - ask.create_time : null,
+    sinceLast: (last || ask).create_time ? now - (last || ask).create_time : null,
+    duration: (last && last.create_time && ask.create_time) ? last.create_time - ask.create_time : null,
+    text: text
+  };
+}
 function loggedOut(){
   return Array.prototype.slice.call(document.querySelectorAll("button,a"))
     .some(function(e){ return /^(log ?in|sign ?up|\u767b\u5f55|\u514d\u8d39\u6ce8\u518c)$/i.test((e.innerText||"").trim()); });
@@ -293,24 +391,28 @@ def _run_js(body: str, timeout: float = 30.0):
         return _exec_on(w, t, body, timeout)
 
 
+def _js_call(body: str, **args):
+    """带参数执行 JS。参数以 JSON 形式注入为 ARGS，JS 里用 ARGS.xxx 取。"""
+    return _run_js(f"var ARGS = {json.dumps(args, ensure_ascii=False)};\n" + body)
+
+
 # --- 操作 -------------------------------------------------------------------
 
 def probe() -> dict:
-    """诊断用：报告当前页面上各选择器的命中情况。"""
+    """诊断用：报告页面上关键元素的命中情况，以及后端能否读到当前会话。"""
     return _run_js("""
+      var backend = null, cid = convId();
+      if (cid) {
+        try { var c = branch(api("/backend-api/conversation/" + cid));
+              backend = {ok: true, messages: c.length}; }
+        catch (e) { backend = {ok: false, error: String(e.message || e)}; }
+      }
       return {
-        url: location.href,
-        title: document.title,
-        lang: document.documentElement.lang || null,
-        matched: {
-          composer: which("composer"),
-          send: which("send"),
-          stop: which("stop"),
-          assistant: which("assistant")
-        },
-        assistantCount: qa("assistant").length,
-        generating: generating(),
-        lastAnswerPreview: (lastAnswer() || "").slice(0, 200)
+        url: location.href, title: document.title, visibility: document.visibilityState,
+        loggedOut: loggedOut(),
+        matched: { composer: which("composer"), new_chat: which("new_chat"),
+                   send: which("send"), stop: which("stop") },
+        backend: backend
       };
     """)
 
@@ -319,6 +421,10 @@ def new_chat() -> str:
     """开一个全新的 ChatGPT 会话，返回新的 URL。
 
     必须在锁内调用 —— 否则可能把另一个正在等回答的任务的会话切掉。
+
+    判据是 URL 里不再有 /c/<会话id>，而不是"页面上回答条数为 0"：后台标签页
+    根本不渲染对话，条数恒为 0，旧判据会在新会话还没打开时就放行，
+    把消息发进旧会话里。
     """
     _run_js(
         'var b = q("new_chat");'
@@ -328,21 +434,11 @@ def new_chat() -> str:
     deadline = time.monotonic() + NEW_CHAT_TIMEOUT
     while time.monotonic() < deadline:
         time.sleep(0.4)
-        st = _run_js(
-            'return {url: location.href, n: qa("assistant").length,'
-            ' composer: !!q("composer")};'
-        )
-        if st["composer"] and st["n"] == 0:
+        st = _run_js('return {url: location.href, cid: convId(), composer: !!q("composer")};')
+        if st["composer"] and not st["cid"]:
             log.info("已开新会话 %s", st["url"])
             return st["url"]
-    raise BridgeError("点了新建会话，但页面没有变成空会话")
-
-
-def _state() -> dict:
-    return _run_js("""
-      var a = answers();
-      return { n: a.length, generating: generating(), last: a.length ? a[a.length-1] : null };
-    """)
+    raise BridgeError("点了新建会话，但页面没有切到新会话")
 
 
 def _send(prompt: str) -> dict:
@@ -356,11 +452,7 @@ def _send(prompt: str) -> dict:
     info = _run_js(f'''
       var el = q("composer");
       if (!el) throw new Error("找不到输入框（选择器全部落空，跑 probe.py 重新校准）");
-      var a = qa("assistant");
-      var before = a.length;
-      var beforeText = a.length ? (a[a.length-1].innerText||"").trim() : null;
-      var mode = setComposer(el, D("{b64}"));
-      return {{ before: before, beforeText: beforeText, mode: mode }};
+      return {{ mode: setComposer(el, D("{b64}")) }};
     ''')
 
     deadline = time.monotonic() + SEND_BTN_TIMEOUT
@@ -413,48 +505,103 @@ def _exclusive():
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def state() -> dict:
-    """ChatGPT 标签页的实时状态。无副作用，随时可调。"""
-    return _state()
+def read_turn(cid: str | None = None, user_msg_id: str | None = None,
+              prompt: str | None = None, after_id: str | None = None) -> dict:
+    """从 ChatGPT 后端读取一轮问答。无副作用，随时可调。
+
+    定位：给了 user_msg_id 就按 id 找那条提问；否则按 prompt 文本找；
+    都没给就取当前会话的最后一轮。cid 不给就用标签页当前打开的会话 ——
+    给了的话，即使标签页已经切到别的会话也能读。
+
+    返回 found / complete / text / phase 等。complete 以后端的 end_turn 为准。
+    """
+    return _js_call('''
+      var cid = ARGS.cid || convId();
+      if (!cid) return {found: false, why: "标签页当前不在任何会话里"};
+      var chain = branch(api("/backend-api/conversation/" + cid));
+      var a = (ARGS.id || ARGS.prompt) ? anchorIn(chain, ARGS.id, ARGS.prompt, ARGS.after) : null;
+      if (!a) {
+        if (ARGS.id || ARGS.prompt) return {found: false, cid: cid, why: "在会话里找不到这条提问"};
+        var li = lastUserIdx(chain);
+        if (li < 0) return {found: false, cid: cid, why: "会话里还没有提问"};
+        a = {idx: li, by: "last"};
+      }
+      var t = describeTurn(chain, a.idx);
+      t.found = true; t.cid = cid; t.by = a.by;
+      return t;
+    ''', cid=cid, id=user_msg_id, prompt=(prompt or "")[:300], after=after_id)
+
+
+def tail_state() -> dict:
+    """当前会话最后一轮是否还在进行。发送前的 busy 检查用。
+
+    停止按钮 **或** 后端显示这一轮没结束，任一成立就算忙。只看停止按钮不够：
+    GPT 在搜索和推理的间隙，页面状态并不总是可靠，尤其是后台标签页。
+    """
+    t = _js_call('''
+      var stop = generating(), cid = convId();
+      if (!cid) return {stop: stop, found: false};
+      var chain = branch(api("/backend-api/conversation/" + cid));
+      var li = lastUserIdx(chain);
+      if (li < 0) return {stop: stop, found: false};
+      var t = describeTurn(chain, li); t.stop = stop; t.found = true; t.text = null;
+      return t;
+    ''')
+    mid = (t.get("found") and not t["complete"] and not t["interrupted"]
+           and (t["sinceLast"] is None or t["sinceLast"] < BUSY_WINDOW))
+    t["busy"] = bool(t["stop"] or mid)
+    t["why"] = ("页面显示正在生成" if t["stop"]
+                else f"后端显示这一轮还没结束（{t['phase']}）" if mid else None)
+    return t
 
 
 def send_and_confirm(prompt: str, fresh: bool = False) -> dict:
-    """发送一条消息，并阻塞到**确认 GPT 已经开始生成**为止。
+    """发送一条消息，并阻塞到**确认后端已经收到这条提问**为止。
 
-    这个确认是整个设计的关键。返回即代表消息一定进去了，调用方就没有
-    任何理由去"重发以防万一" —— 而重发会打断 GPT 的思考让它从头再想。
+    返回即代表消息一定进去了，调用方就没有任何理由去"重发以防万一" ——
+    而重发会打断 GPT 的思考让它从头再想。返回值里带着这条提问的消息 id，
+    之后取回答时按 id 精确定位，不受页面渲染和虚拟化影响。
 
-    如果发送时 GPT 正在生成，直接抛 Busy 而不是排队等 —— 排队意味着
-    等它答完再插一条，同样会打乱多轮讨论的节奏。
+    如果发送时上一轮还没结束，直接抛 Busy 而不是排队等。
     """
     if not prompt.strip():
         raise BridgeError("prompt 为空")
 
     with _exclusive():
-        pre = _state()
-        if pre["generating"]:
+        tail = tail_state()
+        if tail["busy"]:
             raise Busy(
-                "GPT 正在生成回答，现在不能发新消息。"
-                "先用 get_gpt_answer 取回上一条的结果。"
+                f"GPT 还在回答上一条（{tail['why']}），现在不能发新消息。"
+                "先用 get_gpt_answer 或 read_last_gpt_answer 取回上一条的结果。"
             )
+        after = None if fresh else (tail.get("anchorId") if tail.get("found") else None)
         if fresh:
             new_chat()
 
         sent = _send(prompt)
-        before_text = sent["beforeText"]
-        log.info("已发送 via=%s mode=%s，等待生成开始…", sent["via"], sent["mode"])
+        log.info("已发送 via=%s mode=%s，等待后端确认…", sent["via"], sent["mode"])
 
-        t0 = time.monotonic()
+        t0, saw_stop = time.monotonic(), False
         while time.monotonic() - t0 < START_TIMEOUT:
             time.sleep(POLL_INTERVAL)
-            st = _state()
-            if st["generating"] or st["last"] != before_text:
-                log.info("已确认送达（GPT 开始生成），耗时 %.1fs",
-                         time.monotonic() - t0)
-                return {"delivered": True, "via": sent["via"],
-                        "mode": sent["mode"]}
+            try:
+                r = read_turn(prompt=prompt, after_id=after)
+            except BridgeError:
+                r = {}
+            if r.get("found"):
+                log.info("已确认送达（后端收到提问 %s），耗时 %.1fs",
+                         r["anchorId"][:8], time.monotonic() - t0)
+                return {"delivered": True, "cid": r["cid"], "user_msg_id": r["anchorId"],
+                        "via": sent["via"]}
+            saw_stop = saw_stop or bool(_run_js("return generating();"))
+
+        if saw_stop:
+            # 页面已经在生成，但后端里还没查到这条提问。消息肯定进去了，
+            # 锚点留空，之后取回答时按提问文本补上。
+            log.info("已确认送达（页面在生成），后端锚点稍后按文本补")
+            return {"delivered": True, "cid": None, "user_msg_id": None, "via": sent["via"]}
 
         raise BridgeError(
-            f"发送后 {START_TIMEOUT:.0f}s 没有观察到 GPT 开始生成"
+            f"发送后 {START_TIMEOUT:.0f}s 既没在后端查到这条提问、也没看到 GPT 开始生成"
             f"（发送方式={sent['via']}）。消息可能没进去，或者选择器过期了。"
         )

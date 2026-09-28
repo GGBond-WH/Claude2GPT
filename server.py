@@ -101,8 +101,14 @@ def _protocol(max_rounds: str = "5") -> str:
 INSTRUCTIONS = f"""这个 server 让你能和 GPT（本机 ChatGPT）讨论问题。
 
 工具：ask_gpt（开新会话）/ continue_gpt（续当前会话）发消息，返回时消息
-已确认送达；再用 get_gpt_answer(job_id) 取回答，取到「还在思考」就再取一次。
-GPT 想几分钟是正常的，任何情况下都不要重发消息。
+已确认送达；再用 get_gpt_answer(job_id) 取回答，取到「还没答完」就再取一次。
+GPT 联网搜索加推理几分钟是正常的，任何情况下都不要重发消息。
+
+怀疑拿到的回答不完整，或者 job_id 丢了，用 read_last_gpt_answer 重读 ——
+它不发消息。**不要让 GPT "原样重发"**，那会打乱对话，重写的内容也未必一样。
+
+GPT 回答里的 [1][2] 是它联网引用的来源，列在回答末尾；公式是 LaTeX 源码。
+这些引用仍属于"待核实"，不能因为带了链接就当成已核实的事实。
 
 单次提问（"问一下 GPT X 是什么"）直接用工具即可，不必走下面的流程。
 
@@ -163,29 +169,57 @@ async def continue_gpt(prompt: str) -> str:
     return await anyio.to_thread.run_sync(lambda: _send(prompt, False))
 
 
+def _render(r: jobs.Reading, job_id: str | None = None) -> str:
+    """把一次读取结果写成给 Claude 看的文字。"""
+    again = (f'get_gpt_answer("{job_id}")' if job_id else "read_last_gpt_answer()")
+    head = f"（回答的是：{r.asked}…）\n" if r.asked else ""
+    if r.status == "done":
+        note = f"[注意] {r.note}\n\n" if r.note else ""
+        return head + note + (r.text or "[GPT 返回了空回答]")
+    if r.status == "error":
+        body = f"\n\n{r.text}" if r.text else ""
+        return f"[读取失败] {r.note}{body}"
+    waited = f"已过 {r.elapsed:.0f}s，" if r.elapsed else ""
+    return (
+        f"{head}[GPT 还没答完] {waited}当前状态：{r.phase or '生成中'}。\n"
+        "消息**确认已送达**，GPT 正在处理 —— 联网搜索和推理都会花时间，几分钟是正常的。\n"
+        f"稍后再调用一次 {again} 即可，**不要重发原消息**。"
+    )
+
+
 @server.tool()
 async def get_gpt_answer(job_id: str, wait_seconds: int = 30) -> str:
     """取回 ask_gpt / continue_gpt 的回答。
 
-    最多等 wait_seconds 秒（上限 60）。还在思考就返回 pending —— 这时
-    **再调用一次这个工具**即可，不要重发原消息。GPT 思考几分钟是正常的。
+    最多等 wait_seconds 秒（上限 45，超过会被截到 45 —— 再长会撞上客户端的
+    60 秒请求超时）。还没答完就返回当前状态，这时**再调用一次这个工具**即可，
+    不要重发原消息。
+
+    每次调用都会从 ChatGPT 后端重新读取这一轮，所以不存在"取到半截就定格"
+    的问题：只要 GPT 答完了，返回的就是完整回答。
     """
-    job = await anyio.to_thread.run_sync(jobs.poll, job_id, float(wait_seconds))
-    if job is None:
+    res = await anyio.to_thread.run_sync(jobs.poll, job_id, float(wait_seconds))
+    if res is None:
         return (
             f"[没有这个 job_id: {job_id}] 可能记录已过期。"
-            "不要凭猜测重发消息 —— 先用 get_gpt_answer 试最近的 job_id，"
-            "或者直接看 ChatGPT 页面确认上一条的状态。"
+            "不要凭猜测重发消息 —— 用 read_last_gpt_answer 读取当前会话的最后一轮。"
         )
-    if job.status == "done":
-        return job.answer or "[GPT 返回了空回答]"
-    if job.status == "error":
-        return f"[失败] {job.error}"
-    return (
-        f"[GPT 还在思考] job {job_id}，已思考 {job.thinking_for():.0f}s。\n"
-        "消息**确认已送达**（发送时已观察到 GPT 开始生成）。\n"
-        f'再调用一次 get_gpt_answer("{job_id}") 即可，不要重发原消息。'
-    )
+    _, reading = res
+    return _render(reading, job_id)
+
+
+@server.tool()
+async def read_last_gpt_answer(wait_seconds: int = 0) -> str:
+    """读取 ChatGPT 当前会话**最后一轮**的回答。不需要 job_id，也不发任何消息。
+
+    用于：job_id 丢了、怀疑之前拿到的回答不完整、或者想确认 GPT 现在的状态。
+    **怀疑回答不完整时用这个重读，不要让 GPT 重发** —— 重发会打乱对话，
+    而且它重写的内容未必和原来一样。
+
+    wait_seconds（上限 45）：如果最后一轮还没答完，最多等这么久。
+    """
+    reading = await anyio.to_thread.run_sync(jobs.read_last, float(wait_seconds))
+    return _render(reading)
 
 
 @server.prompt(
