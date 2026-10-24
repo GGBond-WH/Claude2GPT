@@ -45,6 +45,9 @@ class Job:
     elapsed: float | None = None
     cid: str | None = None           # 所在会话
     user_msg_id: str | None = None   # 这条提问的消息 id —— 重读回答的锚点
+    after_id: str | None = None      # 发送前最后一条提问的 id —— 按文本补锚点时只认它之后的
+    final: bool = False              # 后端已确认答完（end_turn=True），之后不用再读后端
+    asked: str | None = None         # 提问的前 40 字，回显用
 
     def thinking_for(self) -> float:
         return max(0.0, time.time() - self.sent_at)
@@ -99,6 +102,7 @@ def submit(prompt: str, fresh: bool = False) -> Job:
         id=uuid.uuid4().hex[:8], prompt=prompt[:300], fresh=fresh,
         sent_at=time.time(), delivered=True, status="generating",
         cid=sent.get("cid"), user_msg_id=sent.get("user_msg_id"),
+        after_id=sent.get("after_id"),
     )
     _save(job)
     _prune()
@@ -109,6 +113,15 @@ def submit(prompt: str, fresh: bool = False) -> Job:
 
 def _deadline(wait_seconds: float) -> float:
     return time.monotonic() + max(0.0, min(float(wait_seconds), MAX_WAIT))
+
+
+def _limited(job: Job, exc: "bridge.RateLimited") -> Reading:
+    """被限流且等不到它解除：如实说明，让调用方过一会儿再来，不要重发。"""
+    note = (f"ChatGPT 后端暂时限流（HTTP 429），请约 {exc.retry_after:.0f} 秒后再取。"
+            "这不影响 GPT 生成，消息也已经送达。")
+    if job.answer:
+        return Reading(job.status, job.answer, job.elapsed, note=note + "下面是上次读到的内容。")
+    return Reading("generating", elapsed=job.thinking_for(), note=note, asked=job.asked)
 
 
 def _stale(job: Job, why: str) -> Reading:
@@ -124,14 +137,32 @@ def poll(job_id: str, wait_seconds: float) -> tuple[Job, Reading] | None:
     job = load(job_id)
     if job is None:
         return None
+    # 后端已经给过 end_turn=True 的，回答不会再变，不必再请求 ——
+    # 早期的冻结问题出在"DOM 判定的完成"不可靠，后端判定的没有这个问题。
+    if job.final and job.answer:
+        return job, Reading("done", job.answer, job.elapsed, asked=job.asked)
     deadline = _deadline(wait_seconds)
 
     while True:
         try:
-            r = bridge.read_turn(cid=job.cid, user_msg_id=job.user_msg_id, prompt=job.prompt)
+            r = bridge.read_turn(cid=job.cid, user_msg_id=job.user_msg_id, prompt=job.prompt,
+                                 after_id=None if job.user_msg_id else job.after_id,
+                                 since=None if job.cid else job.sent_at)
+        except bridge.RateLimited as exc:
+            if time.monotonic() + exc.retry_after < deadline:
+                time.sleep(exc.retry_after)
+                continue
+            return job, _limited(job, exc)
         except bridge.BridgeError as exc:
             return job, _stale(job, f"刷新失败：{exc}")
         if not r.get("found"):
+            if r.get("pending") and job.thinking_for() < 180:
+                # 刚发出、会话还没在后端出现：当作还在生成，等一会儿再读
+                if time.monotonic() + bridge.API_POLL >= deadline:
+                    return job, Reading("generating", elapsed=job.thinking_for(),
+                                        phase="等待会话创建", asked=job.prompt[:40])
+                time.sleep(bridge.API_POLL)
+                continue
             return job, _stale(job, r.get("why") or "找不到这条提问")
 
         dirty = False
@@ -143,6 +174,7 @@ def poll(job_id: str, wait_seconds: float) -> tuple[Job, Reading] | None:
         if r["complete"] or r["interrupted"]:
             job.status, job.answer, job.error = "done", r["text"], None
             job.elapsed = r.get("duration") or job.thinking_for()
+            job.final, job.asked = bool(r["complete"]), r.get("anchorText")
             _save(job)
             log.info("任务 %s 完成，%d 字，耗时 %.1fs", job_id, len(r["text"]), job.elapsed)
             note = "GPT 这一轮被中断了，下面是它已经输出的部分。" if r["interrupted"] and not r["complete"] else None
@@ -166,6 +198,12 @@ def read_last(wait_seconds: float = 0) -> Reading:
     while True:
         try:
             r = bridge.read_turn()
+        except bridge.RateLimited as exc:
+            if time.monotonic() + exc.retry_after < deadline:
+                time.sleep(exc.retry_after)
+                continue
+            return Reading("error", note=f"ChatGPT 后端暂时限流（HTTP 429），"
+                                         f"请约 {exc.retry_after:.0f} 秒后再读。")
         except bridge.BridgeError as exc:
             return Reading("error", note=str(exc))
         if not r.get("found"):

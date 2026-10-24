@@ -21,10 +21,12 @@ from __future__ import annotations
 import base64
 import fcntl
 import json
+import re
 import logging
 import os
 import subprocess
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -38,6 +40,9 @@ TAB_URL = "https://chatgpt.com/"
 
 SELECTORS = {
     "composer": [
+        # 2026-10 改版后的实测值。旧的 #prompt-textarea 已不存在。
+        'div[contenteditable="true"][aria-label="询问 ChatGPT"]',
+        'div[contenteditable="true"][aria-label*="Ask"]',
         # 刻意不放 "form textarea" —— 未登录的营销页也有一个，会被误认成可用标签页
         "#prompt-textarea",
         'div[contenteditable="true"][id="prompt-textarea"]',
@@ -45,6 +50,8 @@ SELECTORS = {
         'main div[contenteditable="true"]',
     ],
     "send": [
+        # 只在输入框有字时存在
+        'main form button[aria-label="发送"]',
         '[data-testid="send-button"]',
         'button[aria-label*="Send"]',
         'button[aria-label*="发送"]',
@@ -56,6 +63,9 @@ SELECTORS = {
         'button[aria-label*="停止"]',
     ],
     "new_chat": [
+        # 2026-10 改版后从 <a> 变成了 <button>，页面上有两个（侧边栏和顶栏），效果相同
+        'button[aria-label="新聊天"]',
+        'button[aria-label="New chat"]',
         '[data-testid="create-new-chat-button"]',
         'a[aria-label="新聊天"]',
         'a[aria-label*="New chat"]',
@@ -68,12 +78,21 @@ SELECTORS = {
 }
 
 POLL_INTERVAL = 0.6      # 秒，DOM 轮询（发送、新建会话）
-API_POLL = 1.5           # 秒，后端轮询（取回答）
-START_TIMEOUT = 20.0     # 从发送到"看见生成开始"的上限
+API_POLL = 4.0           # 秒，后端轮询（取回答）。原来 1.5 会触发 HTTP 429
+CONFIRM_API_GAP = 2.5    # 秒，发送确认时读后端的间隔（DOM 仍按 POLL_INTERVAL 看）
+RATE_LIMIT_BACKOFF = 15.0  # 秒，429 没带 Retry-After 时退避多久
+# 发送是一次阻塞的 MCP 调用，下面几段加起来必须明显小于客户端的 60 秒请求超时，
+# 否则客户端会超时重启 server，Claude 可能以为没发出去而重发。
+# 最坏情况：整页加载 12 + 等发送键 15 + 提交表单后观察 3 + 等后端确认 14 ≈ 44 秒。
+# 正常情况：加载 3 + 发送键 7 + 确认 3 ≈ 13 秒。
+START_TIMEOUT = 14.0     # 从发送到"后端收到这条提问"的上限
 GEN_TIMEOUT = 900.0      # 一轮里超过这么久没有新消息，视为中断
 BUSY_WINDOW = 900.0      # 后端显示"这一轮没结束"时，最近多久内有动静才算真在进行
-SEND_BTN_TIMEOUT = 6.0   # 等发送键出现的上限
-NEW_CHAT_TIMEOUT = 15.0  # 点新建会话后等页面变空的上限
+SEND_BTN_TIMEOUT = 15.0  # 等发送键变成可点的上限。早已加载好的页面 0.3 秒；
+                         # 后台里刚整页加载完的页面实测要 7 秒
+SUBMIT_SETTLE = 3.0      # 直接提交表单后，观察是否真的发出去的时间
+MAX_REFILL = 3           # 输入框被冲掉后最多重填几次
+NEW_CHAT_TIMEOUT = 12.0  # 整页加载新会话页的上限
 LOCK_TIMEOUT = 900.0     # 等其他调用释放锁的上限（任务会排队，等待是正常的）
 
 _LOCK = Path.home() / ".gpt_bridge.lock"
@@ -90,6 +109,14 @@ log = logging.getLogger("gpt-bridge")
 
 class BridgeError(RuntimeError):
     pass
+
+
+class RateLimited(BridgeError):
+    """ChatGPT 后端返回 429。应该退避，而不是立刻重试 —— 重试只会让限流更久。"""
+
+    def __init__(self, retry_after: float):
+        super().__init__(f"ChatGPT 后端限流（HTTP 429），{retry_after:.0f} 秒后再试")
+        self.retry_after = retry_after
 
 
 class Busy(BridgeError):
@@ -116,15 +143,30 @@ function generating(){ return !!q("stop"); }
 // 标签页，生成完毕 5 分钟后 DOM 里仍然一个轮次都没有），而停止按钮的状态照常
 // 更新 —— 于是"停止按钮消失 + 文本不再变化"会把渲染到一半的文本当成完整回答。
 // 这里改走页面自己加载对话时用的同一个接口，拿到的是权威的原始数据。
-function api(path){
-  // 登录态令牌只在这个函数里用，绝不返回，所以不会离开浏览器
+function apiToken(force){
+  // 登录态令牌缓存在页面里，省掉每次都请求 /api/auth/session —— 原来每次读后端
+  // 都是 2 个请求，这是触发 429 的主因之一。同源的脚本本来就能调那个接口拿到
+  // 令牌，缓存在这里不扩大暴露面；它也从不返回给 Python，不会离开浏览器。
+  var c = window.__gptBridgeTok;
+  if (!force && c && Date.now() - c.at < 600000) return c.tok;
   var s = new XMLHttpRequest(); s.open("GET", "/api/auth/session", false); s.send();
+  if (s.status === 429) throw new Error("RATE_LIMITED " + (s.getResponseHeader("Retry-After") || ""));
   var tok = null; try { tok = JSON.parse(s.responseText).accessToken; } catch (e) {}
   if (!tok) throw new Error("拿不到 ChatGPT 登录态（可能已退出登录）");
-  var x = new XMLHttpRequest(); x.open("GET", path, false);
-  x.setRequestHeader("Authorization", "Bearer " + tok); x.send();
-  if (x.status !== 200) throw new Error("ChatGPT 后端返回 HTTP " + x.status);
-  return JSON.parse(x.responseText);
+  Object.defineProperty(window, "__gptBridgeTok",
+    {value: {tok: tok, at: Date.now()}, configurable: true, writable: true, enumerable: false});
+  return tok;
+}
+function api(path){
+  var tok = apiToken(false);
+  for (var attempt = 0; attempt < 2; attempt++) {
+    var x = new XMLHttpRequest(); x.open("GET", path, false);
+    x.setRequestHeader("Authorization", "Bearer " + tok); x.send();
+    if (x.status === 200) return JSON.parse(x.responseText);
+    if (x.status === 429) throw new Error("RATE_LIMITED " + (x.getResponseHeader("Retry-After") || ""));
+    if ((x.status === 401 || x.status === 403) && attempt === 0) { tok = apiToken(true); continue; }
+    throw new Error("ChatGPT 后端返回 HTTP " + x.status);
+  }
 }
 function convId(){ var m = location.pathname.match(/\/c\/([0-9a-f-]+)/); return m ? m[1] : null; }
 function branch(d){
@@ -178,6 +220,19 @@ function anchorIn(chain, id, prefix, afterId){
   var want = norm60(prefix);
   if (want) for (i = chain.length - 1; i > floor; i--)
     if (role(chain[i]) === "user" && norm60(msgText(chain[i])) === want) return {idx: i, by: "text"};
+  return null;
+}
+function findConvByPrompt(prompt, since){
+  // 新会话发出第一条后，地址栏要过一阵才变成 /c/<id>（后台标签页里这一步被推迟，
+  // 实测十几秒）。不等地址栏：从会话列表里找发送之后新建、且第一条提问就是
+  // 这条的会话。服务器时间和本机可能有偏差，时间窗放宽到 5 分钟。
+  var items = api("/backend-api/conversations?offset=0&limit=5&order=updated").items || [];
+  for (var i = 0; i < items.length; i++) {
+    var c = items[i].create_time;
+    var ct = typeof c === "number" ? c : Date.parse(c) / 1000;
+    if (!(ct >= since - 300)) continue;
+    if (anchorIn(branch(api("/backend-api/conversation/" + items[i].id)), null, prompt, null)) return items[i].id;
+  }
   return null;
 }
 function lastUserIdx(chain){ for (var i = chain.length - 1; i >= 0; i--) if (role(chain[i]) === "user") return i; return -1; }
@@ -282,7 +337,11 @@ def _decode(proc: subprocess.CompletedProcess) -> object:
     except Exception as exc:
         raise BridgeError(f"无法解析 JS 返回值: {out[:200]!r}") from exc
     if not result.get("ok"):
-        raise BridgeError(f"JS 执行出错: {result.get('error')}")
+        err = result.get("error") or ""
+        m = re.search(r"RATE_LIMITED\s*(\d+)?", err)
+        if m:
+            raise RateLimited(float(m.group(1)) if m.group(1) else RATE_LIMIT_BACKOFF)
+        raise BridgeError(f"JS 执行出错: {err}")
     return result["data"]
 
 
@@ -382,13 +441,15 @@ def _resolve(force: bool = False) -> tuple[int, int]:
 
 
 def _run_js(body: str, timeout: float = 30.0):
-    """在可用的 chatgpt.com 标签页上执行 JS。标签页移动过就重新解析一次。"""
+    """在认领的 chatgpt.com 标签页上执行 JS。
+
+    出错就直接抛，不再"强制重新认领一个标签页再试"。旧逻辑在任何错误后都会
+    重扫并挑第一个可用的标签页 —— 可能悄悄切到另一个标签页（比如用户的讨论页）
+    继续操作；遇到 429 时还会立刻重发，让限流更久。标签页被移动的情况已由
+    _resolve 按 tab id 处理，被关闭时 _resolve 也会自己重新认领。
+    """
     w, t = _resolve()
-    try:
-        return _exec_on(w, t, body, timeout)
-    except BridgeError:
-        w, t = _resolve(force=True)
-        return _exec_on(w, t, body, timeout)
+    return _exec_on(w, t, body, timeout)
 
 
 def _js_call(body: str, **args):
@@ -417,56 +478,177 @@ def probe() -> dict:
     """)
 
 
-def new_chat() -> str:
-    """开一个全新的 ChatGPT 会话，返回新的 URL。
+def _exec_pinned(body: str):
+    """只在已认领的那个标签页上执行，绝不改认领别的标签页。
 
-    必须在锁内调用 —— 否则可能把另一个正在等回答的任务的会话切掉。
-
-    判据是 URL 里不再有 /c/<会话id>，而不是"页面上回答条数为 0"：后台标签页
-    根本不渲染对话，条数恒为 0，旧判据会在新会话还没打开时就放行，
-    把消息发进旧会话里。
+    页面整页导航期间，输入框会短暂消失 —— 这时如果走 _resolve 的重新认领，
+    会把用户的另一个 chatgpt.com 标签页认领过来。
     """
-    _run_js(
-        'var b = q("new_chat");'
-        'if (!b) throw new Error("找不到新建会话按钮（选择器过期，跑 probe.py）");'
-        'b.click(); return 1;'
-    )
-    deadline = time.monotonic() + NEW_CHAT_TIMEOUT
+    pos = _find_by_id(_TAB_ID) if _TAB_ID else None
+    if pos is None:
+        raise BridgeError("认领的标签页不见了")
+    return _exec_on(*pos, body)
+
+
+def _navigate(js_nav: str, want_cid, timeout: float) -> dict | None:
+    """整页跳转，并等到**新页面**加载好（输入框出现、URL 符合预期）。
+
+    跳转前在旧页面的 window 上打一个标记，新页面里标记不存在，才算加载完成。
+    不打标记的话，跳转是异步的，第一次检查时旧页面往往还在 —— 而它可能刚好也
+    满足"有输入框、URL 对"，于是被误当成新页面，接着往旧的失灵输入框里填字。
+    加载期间只在本标签页上轮询。
+    """
+    token = uuid.uuid4().hex[:12]
+    _run_js(f'window.__gptBridgeNav = "{token}"; {js_nav}; return true;')
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        time.sleep(0.4)
-        st = _run_js('return {url: location.href, cid: convId(), composer: !!q("composer")};')
-        if st["composer"] and not st["cid"]:
-            log.info("已开新会话 %s", st["url"])
-            return st["url"]
-    raise BridgeError("点了新建会话，但页面没有切到新会话")
+        time.sleep(0.5)
+        try:
+            st = _exec_pinned(f'return {{fresh: window.__gptBridgeNav !== "{token}", url: location.href,'
+                              f' cid: convId(), composer: !!q("composer")}};')
+        except BridgeError:
+            continue                  # 页面还没起来
+        if st["fresh"] and st["composer"] and st["cid"] == want_cid:
+            return st
+    return None
+
+
+def new_chat() -> str:
+    """开一个全新的 ChatGPT 会话，返回新的 URL。必须在锁内调用。
+
+    **一律整页加载首页，不点"新聊天"按钮。** 实测在后台标签页里：
+      * 点按钮（页面内跳转）后，新输入框一直初始化不完，75 秒内一个字都填不进去；
+      * 整页加载后，1 秒字就能留住，7 秒发送键可点。
+    10-10 到 10-13 的发送失败全出在这里。顺带也不再依赖"新聊天"按钮的选择器
+    —— 那是 ChatGPT 改版时最先坏的一个。
+    """
+    st = _navigate('location.assign("/")', None, NEW_CHAT_TIMEOUT)
+    if st is None:
+        raise BridgeError(f"新建会话超时：整页加载首页 {NEW_CHAT_TIMEOUT:.0f}s 内没有出现可用的输入框")
+    log.info("已开新会话 %s（整页加载）", st["url"])
+    return st["url"]
+
+
+def _reload_current() -> bool:
+    """整页重新加载当前页面。输入框失灵时的自愈手段。"""
+    cid = _run_js("return convId();")
+    return _navigate("location.reload()", cid, NEW_CHAT_TIMEOUT) is not None
+
+
+_SNAPSHOT = r"""
+  var el = q("composer"), f = el ? el.closest("form") : null, b = q("send");
+  return {
+    url: location.href.slice(0, 60), visibility: document.visibilityState,
+    composer: which("composer"), composerLen: el ? (el.innerText || "").trim().length : null,
+    send: which("send"), sendDisabled: b ? !!b.disabled : null,
+    formButtons: f ? Array.prototype.slice.call(f.querySelectorAll("button")).map(function(x){
+      return (x.getAttribute("aria-label") || x.getAttribute("data-testid") || "?") + (x.disabled ? "(禁用)" : "");
+    }) : null,
+    dialogs: Array.prototype.slice.call(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+      .map(function(d){ return (d.getAttribute("aria-label") || d.innerText || "").replace(/\s+/g, " ").slice(0, 60); })
+  };
+"""
+
+
+_FILL = r"""
+  var el = q("composer");
+  if (!el) throw new Error("找不到输入框（选择器全部落空，跑 probe.py 重新校准）");
+  var mode = setComposer(el, D(ARGS.b64));
+  el.setAttribute("data-gpt-bridge", ARGS.mark);
+  return { mode: mode, n: (el.innerText || "").replace(/\s+/g, "").length };
+"""
+
+# 输入框是否还是我们填的那一个、内容是否还在。字数以"填完后编辑器实际呈现的"
+# 为准 —— 编辑器可能改写文本（比如 Markdown 记号），不能拿原始 prompt 去比。
+_INTACT = r"""
+  var el = q("composer");
+  var ours = !!(el && el.getAttribute("data-gpt-bridge") === ARGS.mark);
+  var n = el ? (el.innerText || "").replace(/\s+/g, "").length : 0;
+  return { ours: ours, n: n,
+           intact: ours && n > 0 && Math.abs(n - ARGS.n) <= Math.max(2, ARGS.n * 0.02) };
+"""
 
 
 def _send(prompt: str) -> dict:
-    """把 prompt 填进输入框并发出去。
+    """把 prompt 填进输入框并发出去。返回 via = button / submit / enter。
 
-    分两步做是有原因的：ChatGPT 的发送键在输入框为空时根本不存在（那个位置
-    显示的是语音按钮），填入文本后由 React 异步换上。所以不能在填入的同一个
-    JS tick 里找发送键 —— 那时它还没渲染出来，会静默落到回车回退分支。
+    填完不能立刻假设字还在。从一个会话切到新会话后，ChatGPT 会重置输入框；
+    后台标签页的定时器被节流，这次重置会被推迟到我们填完字之后才执行，把字
+    冲掉 —— 输入框一空，发送键就不出现。10-10 到 10-13 的失败全是这个原因：
+    每次都是"从讨论会话点新聊天、再发送"，而续当前会话从没失败过。
+
+    所以填字时给输入框打上标记、记下填完后的字数，点发送前核对：输入框被
+    换掉或字数对不上就重填。核对字数也防止误发 —— 万一 ChatGPT 恢复出一段
+    旧草稿，字数基本不可能恰好一致。
+
+    发送键一直不可点时，先直接提交表单，不行再模拟回车。走到这两步会把页面
+    现场写进日志。
     """
+    mark = uuid.uuid4().hex[:12]
     b64 = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
-    info = _run_js(f'''
-      var el = q("composer");
-      if (!el) throw new Error("找不到输入框（选择器全部落空，跑 probe.py 重新校准）");
-      return {{ mode: setComposer(el, D("{b64}")) }};
-    ''')
+    info = _js_call(_FILL, b64=b64, mark=mark)
+    if info["n"] == 0:
+        # 输入框一个字都不接受 —— 后台标签页里经过页面内跳转后就是这个状态，
+        # 等多久都不会好。整页重载后输入框会正常初始化。
+        log.info("输入框不接受输入，整页重新加载当前页面后重试")
+        if not _reload_current():
+            return {**info, "via": "none", "refills": 0}
+        info = _js_call(_FILL, b64=b64, mark=mark)
+        if info["n"] == 0:
+            return {**info, "via": "none", "refills": 0}
+    expect, refills = info["n"], 0
+
+    def ensure_intact() -> bool:
+        nonlocal expect, refills
+        st = _js_call(_INTACT, mark=mark, n=expect)
+        if st["intact"]:
+            return True
+        if refills >= MAX_REFILL:
+            return False
+        refills += 1
+        log.info("输入框里的字被冲掉了（%s，剩 %d 字），重填第 %d 次",
+                 "输入框被替换" if not st["ours"] else "内容被清空或改动", st["n"], refills)
+        expect = _js_call(_FILL, b64=b64, mark=mark)["n"]
+        return False
 
     deadline = time.monotonic() + SEND_BTN_TIMEOUT
     while time.monotonic() < deadline:
-        clicked = _run_js(
-            'var b = q("send");'
-            'if (!b || b.disabled) return {done:false};'
-            'b.click(); return {done:true};'
-        )
-        if clicked["done"]:
-            return {**info, "via": "button"}
+        if ensure_intact():
+            clicked = _run_js(
+                'var b = q("send");'
+                'if (!b || b.disabled) return {done:false};'
+                'b.click(); return {done:true};'
+            )
+            if clicked["done"]:
+                return {**info, "via": "button", "refills": refills}
         time.sleep(0.25)
 
-    # 回退：直接在输入框上敲回车
+    snap = _run_js(_SNAPSHOT)
+    log.warning("发送键 %.0fs 内一直不可点（已重填 %d 次），改为直接提交表单。现场：%s",
+                SEND_BTN_TIMEOUT, refills, json.dumps(snap, ensure_ascii=False))
+    if not ensure_intact() and not ensure_intact():
+        # 字一直留不住，就不要去提交 —— 提交一个空的或别的内容都不对
+        return {**info, "via": "none", "refills": refills}
+
+    # 回退一：直接提交表单
+    submitted = _run_js(
+        'var el = q("composer"), f = el && el.closest("form"); if (!f) return false;'
+        'if (f.requestSubmit) f.requestSubmit();'
+        'else f.dispatchEvent(new Event("submit", {bubbles: true, cancelable: true}));'
+        'return true;'
+    )
+    if submitted:
+        # 只认"出现停止按钮"。不能拿"输入框变空"当发出去的证据 ——
+        # 输入框也可能是被上面说的那次重置清空的。
+        t = time.monotonic()
+        while time.monotonic() - t < SUBMIT_SETTLE:
+            time.sleep(0.3)
+            if _run_js("return generating();"):
+                return {**info, "via": "submit", "refills": refills}
+
+    # 回退二：在输入框上敲回车（同样先确认字还在）
+    if not ensure_intact() and not ensure_intact():
+        return {**info, "via": "none", "refills": refills}
     _run_js(
         'var el = q("composer"); el.focus();'
         'var ev = {key:"Enter", code:"Enter", keyCode:13, which:13,'
@@ -475,7 +657,7 @@ def _send(prompt: str) -> dict:
         'el.dispatchEvent(new KeyboardEvent("keyup", ev));'
         'return 1;'
     )
-    return {**info, "via": "enter"}
+    return {**info, "via": "enter", "refills": refills}
 
 
 @contextmanager
@@ -506,18 +688,25 @@ def _exclusive():
 
 
 def read_turn(cid: str | None = None, user_msg_id: str | None = None,
-              prompt: str | None = None, after_id: str | None = None) -> dict:
+              prompt: str | None = None, after_id: str | None = None,
+              since: float | None = None) -> dict:
     """从 ChatGPT 后端读取一轮问答。无副作用，随时可调。
 
     定位：给了 user_msg_id 就按 id 找那条提问；否则按 prompt 文本找；
     都没给就取当前会话的最后一轮。cid 不给就用标签页当前打开的会话 ——
     给了的话，即使标签页已经切到别的会话也能读。
 
+    since：发送时刻（epoch 秒）。给了它、又不知道会话 id、地址栏也还没更新时，
+    从会话列表里找发送之后新建的那个会话。
+
     返回 found / complete / text / phase 等。complete 以后端的 end_turn 为准。
+    found=False 且 pending=True 表示会话还没出现，应当稍后再读，不算错误。
     """
     return _js_call('''
       var cid = ARGS.cid || convId();
-      if (!cid) return {found: false, why: "标签页当前不在任何会话里"};
+      if (!cid && ARGS.prompt && ARGS.since) cid = findConvByPrompt(ARGS.prompt, ARGS.since);
+      if (!cid) return {found: false, pending: !!ARGS.since, why: ARGS.since
+        ? "会话还没在 ChatGPT 后端出现（刚发出，稍后再读）" : "标签页当前不在任何会话里"};
       var chain = branch(api("/backend-api/conversation/" + cid));
       var a = (ARGS.id || ARGS.prompt) ? anchorIn(chain, ARGS.id, ARGS.prompt, ARGS.after) : null;
       if (!a) {
@@ -529,7 +718,7 @@ def read_turn(cid: str | None = None, user_msg_id: str | None = None,
       var t = describeTurn(chain, a.idx);
       t.found = true; t.cid = cid; t.by = a.by;
       return t;
-    ''', cid=cid, id=user_msg_id, prompt=(prompt or "")[:300], after=after_id)
+    ''', cid=cid, id=user_msg_id, prompt=(prompt or "")[:300], after=after_id, since=since)
 
 
 def tail_state() -> dict:
@@ -579,29 +768,53 @@ def send_and_confirm(prompt: str, fresh: bool = False) -> dict:
             new_chat()
 
         sent = _send(prompt)
-        log.info("已发送 via=%s mode=%s，等待后端确认…", sent["via"], sent["mode"])
+        if sent["via"] == "none":
+            snap = _run_js(_SNAPSHOT)
+            _run_js('setComposer(q("composer"), ""); return 1;')
+            raise BridgeError(
+                f"输入框里的字反复被页面冲掉（已重填 {sent['refills']} 次），没有发送，"
+                f"输入框已清空，可以直接重试。页面现场：{json.dumps(snap, ensure_ascii=False)}"
+            )
+        log.info("已发送 via=%s mode=%s 重填=%d 次，等待后端确认…",
+                 sent["via"], sent["mode"], sent.get("refills", 0))
 
-        t0, saw_stop = time.monotonic(), False
+        # 停止按钮是 DOM 状态，看它不花网络请求，可以勤看；后端读取要省着用 ——
+        # 原来每 0.6s 读一次后端、每次 2 个请求，20 秒内最多 66 个，这是 429 的主因。
+        t0, next_api = time.monotonic(), time.monotonic() + 1.0
         while time.monotonic() - t0 < START_TIMEOUT:
             time.sleep(POLL_INTERVAL)
+            if _run_js("return generating();"):
+                # 停止按钮就是送达的证明：发送前已确认上一轮结束，现在出现的只能是
+                # 我们这条。不再干等后端 —— 刚整页加载完的页面上，第一次读后端实测
+                # 要十几秒，而停止按钮发送后 0.9 秒就出现了。消息 id 留给取回答时补。
+                log.info("已确认送达（页面出现停止按钮，发送后 %.1fs）", time.monotonic() - t0)
+                return {"delivered": True, "cid": _run_js("return convId();"), "user_msg_id": None,
+                        "after_id": after, "via": sent["via"]}
+            if time.monotonic() < next_api:
+                continue
+            next_api = time.monotonic() + CONFIRM_API_GAP
             try:
                 r = read_turn(prompt=prompt, after_id=after)
+            except RateLimited as exc:
+                next_api = time.monotonic() + exc.retry_after
+                continue
             except BridgeError:
-                r = {}
+                continue
             if r.get("found"):
                 log.info("已确认送达（后端收到提问 %s），耗时 %.1fs",
                          r["anchorId"][:8], time.monotonic() - t0)
                 return {"delivered": True, "cid": r["cid"], "user_msg_id": r["anchorId"],
-                        "via": sent["via"]}
-            saw_stop = saw_stop or bool(_run_js("return generating();"))
+                        "after_id": after, "via": sent["via"]}
 
-        if saw_stop:
-            # 页面已经在生成，但后端里还没查到这条提问。消息肯定进去了，
-            # 锚点留空，之后取回答时按提问文本补上。
-            log.info("已确认送达（页面在生成），后端锚点稍后按文本补")
-            return {"delivered": True, "cid": None, "user_msg_id": None, "via": sent["via"]}
-
+        # 没发出去：清掉输入框里的文字，免得它留在那儿、之后被误发
+        try:
+            snap = _run_js(_SNAPSHOT)
+            _run_js('setComposer(q("composer"), ""); return 1;')
+        except BridgeError:
+            snap = None
+        log.warning("发送失败，现场：%s", json.dumps(snap, ensure_ascii=False))
         raise BridgeError(
             f"发送后 {START_TIMEOUT:.0f}s 既没在后端查到这条提问、也没看到 GPT 开始生成"
-            f"（发送方式={sent['via']}）。消息可能没进去，或者选择器过期了。"
+            f"（发送方式={sent['via']}）。消息没有发出去，输入框已清空，可以直接重试。"
+            f"页面现场：{json.dumps(snap, ensure_ascii=False) if snap else '读不到'}"
         )

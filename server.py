@@ -180,8 +180,9 @@ def _render(r: jobs.Reading, job_id: str | None = None) -> str:
         body = f"\n\n{r.text}" if r.text else ""
         return f"[读取失败] {r.note}{body}"
     waited = f"已过 {r.elapsed:.0f}s，" if r.elapsed else ""
+    note = f"[注意] {r.note}\n" if r.note else ""
     return (
-        f"{head}[GPT 还没答完] {waited}当前状态：{r.phase or '生成中'}。\n"
+        f"{head}{note}[GPT 还没答完] {waited}当前状态：{r.phase or '生成中'}。\n"
         "消息**确认已送达**，GPT 正在处理 —— 联网搜索和推理都会花时间，几分钟是正常的。\n"
         f"稍后再调用一次 {again} 即可，**不要重发原消息**。"
     )
